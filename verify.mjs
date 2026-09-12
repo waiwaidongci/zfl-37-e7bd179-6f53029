@@ -21,10 +21,10 @@ function ok(name, cond, extra = "") {
   }
 }
 
-function startServer(port, dbPath) {
+function startServer(port, dbPath, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["server.js"], {
-      env: { ...process.env, PORT: String(port), INK_DB: dbPath },
+      env: { ...process.env, PORT: String(port), INK_DB: dbPath, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let buf = "";
@@ -121,9 +121,10 @@ async function main() {
   ok("恰好 1 个领用成功", success.length === 1, `成功 ${success.length} 个`);
   ok("其余 7 个被拒绝", rejected.length === 7, `拒绝 ${rejected.length} 个`);
   ok("拒绝原因提示不可重复领用及当前持有人", rejected.every((x) => /不能重复领用/.test(x.json.message)));
+  const winner = success[0].json.holder.operator; // 并发胜出者，后续试磨/归还必须是本人
   r = await req(base, "GET", "/api/items?status=试磨中");
   const t1 = r.json.items.find((i) => i.code === "IS-T1");
-  ok("IS-T1 状态=试磨中，且有唯一持有人", t1 && t1.status === "试磨中" && t1.holder && t1.holder.operator);
+  ok("IS-T1 状态=试磨中，且有唯一持有人", t1 && t1.status === "试磨中" && t1.holder && t1.holder.operator === winner);
   const t1Full = (await req(base, "GET", "/api/items")).json.items.find((i) => i.code === "IS-T1");
   ok("履历中只有 1 条领用事件", t1Full.events.filter((e) => e.type === "checkout").length === 1);
 
@@ -136,8 +137,8 @@ async function main() {
   ok("IS-IDEM 只有一条（没有重复建档）", allItems.filter((i) => i.code === "IS-IDEM").length === 1);
 
   console.log("\n⑦ 试磨中连续追加试磨记录");
-  const testPayload = (paper, score) => ({
-    operator: "并发用户0", paper, water: "20滴", speed: "快",
+  const testPayload = (paper, score, operator = winner) => ({
+    operator, paper, water: "20滴", speed: "快",
     colorLayer: "焦浓重淡清", sediment: "无", score, note: "",
   });
   r = await req(base, "POST", "/api/items/IS-T1/tests", testPayload("净皮宣纸", 92), "k-test-1");
@@ -150,17 +151,17 @@ async function main() {
   }, "k-test-3");
   ok("评分越界（120）被拒", r.status === 400 && r.json.error === "bad_score");
   r = await req(base, "POST", "/api/items/IS-T1/tests", {
-    operator: "并发用户0", paper: "", water: "", speed: "", colorLayer: "", sediment: "", score: 80,
+    operator: winner, paper: "", water: "", speed: "", colorLayer: "", sediment: "", score: 80,
   }, "k-test-4");
   ok("试磨必填字段缺失被拒", r.status === 409 && r.json.error === "VALIDATION");
-  r = await req(base, "POST", "/api/items/IS-T1/watch", { operator: "并发用户0", note: "" });
+  r = await req(base, "POST", "/api/items/IS-T1/watch", { operator: winner, note: "" });
   ok("试磨中直接标记重点观察→409，提示先归还", r.status === 409 && /先归还/.test(r.json.message));
   r = await req(base, "POST", "/api/items/IS-T1/checkout", { operator: "别人", position: "台2" });
   ok("试磨中再次领用→409 不可重复领用", r.status === 409 && /不能重复领用/.test(r.json.message));
 
   console.log("\n⑧ 归还闭环与再领用复测");
   r = await req(base, "POST", "/api/items/IS-T1/return", {
-    operator: "并发用户0", position: "试样盒A", toStatus: "已试磨", note: "墨色佳",
+    operator: winner, position: "试样盒A", toStatus: "已试磨", note: "墨色佳",
   }, "k-ret-1");
   ok("归还为已试磨，holder 清空", r.status === 201 && r.json.status === "已试磨" && r.json.holder === null);
   const t1After = (await req(base, "GET", "/api/items")).json.items.find((i) => i.code === "IS-T1");
@@ -168,7 +169,7 @@ async function main() {
   ok("归还事件记录操作人/时间/位置/备注", retEvt && retEvt.operator && retEvt.at && retEvt.position === "试样盒A" && retEvt.note === "墨色佳");
   r = await req(base, "POST", "/api/items/IS-T1/checkout", { operator: "复测员", position: "二号台" }, "k-co-2");
   ok("已试磨可再次领用复测", r.status === 201 && r.json.status === "试磨中");
-  await req(base, "POST", "/api/items/IS-T1/tests", testPayload("皮纸", 68), "k-test-5");
+  await req(base, "POST", "/api/items/IS-T1/tests", testPayload("皮纸", 68, "复测员"), "k-test-5");
   r = await req(base, "POST", "/api/items/IS-T1/return", {
     operator: "复测员", position: "观察架A", toStatus: "重点观察",
   }, "k-ret-2");
@@ -233,6 +234,130 @@ async function main() {
   const o2 = r.json.items.find((i) => i.code === "OLD-2");
   ok("原本待试磨、无记录的墨锭迁移为零事件待试磨", o2.status === "待试磨" && o2.events.length === 0);
   await stopServer(oldServer);
+
+  console.log("\n⑬ 磁盘写入失败：整体回滚，恢复后同键重试成功，并发重试只生效一次");
+  {
+    const recDb = join(dir, "rec-db.json");
+    // 先正常建库并造一锭待试磨墨锭
+    let recServer = await startServer(3201, recDb);
+    const recBase = `http://127.0.0.1:3201`;
+    r = await req(recBase, "POST", "/api/items", { code: "IS-REC", operator: "管理员", storage: "柜R" }, "rec-create");
+    ok("准备：IS-REC 建档成功", r.status === 201);
+    await stopServer(recServer);
+
+    // 以“前 2 次写入失败”模式重启（监听后才生效，不影响启动迁移落盘）
+    recServer = await startServer(3201, recDb, { INK_FAIL_WRITES: "2" });
+
+    r = await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a");
+    ok("写入失败时返回 507 write_failed", r.status === 507 && r.json.error === "write_failed");
+    ok("失败信息明确：未生效/保持原状并提示恢复后重试", /未生效|原状/.test(r.json.message) && /重试/.test(r.json.message));
+
+    let rec = (await req(recBase, "GET", "/api/items")).json.items.find((i) => i.code === "IS-REC");
+    ok("失败后内存未提交：仍为待试磨、无持有人、无领用事件",
+      rec.status === "待试磨" && rec.holder === null && !rec.events.some((e) => e.type === "checkout"));
+    const diskAfterFail = JSON.parse(await readFile(recDb, "utf8"));
+    const diskRec = diskAfterFail.items.find((i) => i.code === "IS-REC");
+    ok("失败后磁盘文件完好且未落任何领用",
+      diskRec.status === "待试磨" && !diskRec.events.some((e) => e.type === "checkout") &&
+      !(diskRec.requestIds && diskRec.requestIds["rec-cc-a"]) && !("rec-cc-a" in (diskAfterFail.requestIds || {})));
+
+    // 第二个客户端也在故障窗口内失败
+    r = await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "乙", position: "台B" }, "rec-cc-b");
+    ok("第二个请求同样明确失败（507）", r.status === 507);
+
+    // 存储恢复（注入次数耗尽）——用各自原来的键重试
+    r = await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a");
+    ok("恢复后甲用原键重试→真正执行成功 201（失败没有占用幂等键）",
+      r.status === 201 && r.json.status === "试磨中" && r.replayed !== "true");
+    r = await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "乙", position: "台B" }, "rec-cc-b");
+    ok("乙用原键重试得到确定结果 409（甲已领用，不会重复领用），只生效一次",
+      r.status === 409 && /不能重复领用/.test(r.json.message));
+    r = await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a");
+    ok("甲再次重放原键→201 且标记 replayed，无重复事件", r.status === 201 && r.replayed === "true");
+    rec = (await req(recBase, "GET", "/api/items")).json.items.find((i) => i.code === "IS-REC");
+    ok("全流程结束只有 1 条领用事件，持有人=甲",
+      rec.events.filter((e) => e.type === "checkout").length === 1 && rec.holder.operator === "甲");
+
+    console.log("\n⑭ 幂等重放返回首次成功的完整快照，后续操作不改写旧响应");
+    const firstSnapshot = (await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a")).json;
+    const eventsAtFirst = firstSnapshot.events.length;
+    ok("快照基线：试磨中、含建档+领用", firstSnapshot.status === "试磨中" && eventsAtFirst === 2 && firstSnapshot.testCount === 0);
+
+    await req(recBase, "POST", "/api/items/IS-REC/tests", {
+      operator: "甲", paper: "宣纸", water: "20滴", speed: "快", colorLayer: "分明", sediment: "无", score: 91,
+    }, "rec-t1");
+    let replay = (await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a")).json;
+    ok("追加试磨后重放旧键：仍是首次快照（试磨中、事件数不变、testCount=0）",
+      replay.status === "试磨中" && replay.events.length === eventsAtFirst && replay.testCount === 0 &&
+      replay.lastEvent.type === "checkout");
+
+    await req(recBase, "POST", "/api/items/IS-REC/return", { operator: "甲", position: "柜R", toStatus: "已试磨" }, "rec-r1");
+    replay = (await req(recBase, "POST", "/api/items/IS-REC/checkout", { operator: "甲", position: "台A" }, "rec-cc-a")).json;
+    ok("归还后重放旧键：快照依然不变（仍报试磨中、持有人仍在）",
+      replay.status === "试磨中" && replay.holder && replay.holder.operator === "甲" &&
+      replay.events.length === eventsAtFirst);
+    const live = (await req(recBase, "GET", "/api/items")).json.items.find((i) => i.code === "IS-REC");
+    ok("而实时状态已是已试磨——重放与当前状态正确隔离", live.status === "已试磨" && live.testCount === 1);
+
+    await stopServer(recServer);
+  }
+
+  console.log("\n⑮ 持用人校验：试磨与归还只能由当前领用人本人操作");
+  {
+    const code = "IS-HOLD";
+    r = await req(base, "POST", "/api/items", { code, operator: "安排员", storage: "柜H" }, "hold-create");
+    ok("建档 IS-HOLD", r.status === 201);
+    r = await req(base, "POST", `/api/items/${code}/checkout`, { operator: "领用人A", position: "三号台" }, "hold-cc");
+    ok("A 领用成功", r.status === 201 && r.json.holder.operator === "领用人A");
+
+    r = await req(base, "POST", `/api/items/${code}/tests`, {
+      operator: "外人B", paper: "宣纸", water: "10滴", speed: "慢", colorLayer: "灰", sediment: "多", score: 50,
+    }, "hold-t-b");
+    ok("外人B 追加试磨→403 holder_mismatch，且提示当前持有人",
+      r.status === 403 && r.json.error === "holder_mismatch" && /领用人A/.test(r.json.message));
+    r = await req(base, "POST", `/api/items/${code}/return`, { operator: "外人B", position: "柜H", toStatus: "已试磨" }, "hold-r-b");
+    ok("外人B 归还→403 holder_mismatch", r.status === 403 && r.json.error === "holder_mismatch");
+    r = await req(base, "POST", `/api/items/${code}/tests`, {
+      operator: "", paper: "宣纸", water: "10滴", speed: "慢", colorLayer: "灰", sediment: "多", score: 50,
+    }, "hold-t-empty");
+    ok("操作人为空仍按必填拦截（409 VALIDATION）", r.status === 409 && r.json.error === "VALIDATION");
+
+    const holdItem = (await req(base, "GET", "/api/items")).json.items.find((i) => i.code === code);
+    ok("被拒操作未留下任何试磨/归还事件，仍由 A 试磨中",
+      holdItem.status === "试磨中" && holdItem.holder.operator === "领用人A" &&
+      holdItem.testCount === 0 && !holdItem.events.some((e) => e.type === "return"));
+
+    r = await req(base, "POST", `/api/items/${code}/tests`, {
+      operator: "领用人A", paper: "净皮宣", water: "22滴", speed: "中", colorLayer: "浓淡分明", sediment: "极少", score: 88,
+    }, "hold-t-a");
+    ok("领用人 A 本人追加试磨成功", r.status === 201 && r.json.testCount === 1);
+    r = await req(base, "POST", `/api/items/${code}/return`, { operator: "领用人A", position: "柜H", toStatus: "已试磨" }, "hold-r-a");
+    ok("领用人 A 本人归还成功", r.status === 201 && r.json.status === "已试磨" && r.json.holder === null);
+  }
+
+  console.log("\n⑯ 落盘等待期间的读一致性：GET 看不到未提交状态");
+  {
+    const slowDb = join(dir, "slow-db.json");
+    const slowServer = await startServer(3202, slowDb, { INK_SLOW_WRITE_MS: "400" });
+    const slowBase = `http://127.0.0.1:3202`;
+    await req(slowBase, "POST", "/api/items", { code: "IS-SLOW", operator: "管理员", storage: "柜S" }, "slow-create");
+
+    // 发起领用（落盘要 400ms），在等待期间连续 GET
+    const checkoutPromise = req(slowBase, "POST", "/api/items/IS-SLOW/checkout",
+      { operator: "甲", position: "台A" }, "slow-cc");
+    await sleep(120); // 此刻正在落盘、尚未提交
+    const during = (await req(slowBase, "GET", "/api/items")).json.items.find((i) => i.code === "IS-SLOW");
+    ok("落盘进行中 GET 仍是旧状态（待试磨、无持有人、无领用事件）",
+      during.status === "待试磨" && during.holder === null &&
+      !during.events.some((e) => e.type === "checkout"));
+    const checkoutRes = await checkoutPromise;
+    ok("落盘完成后领用请求成功", checkoutRes.status === 201 && checkoutRes.json.status === "试磨中");
+    const after = (await req(slowBase, "GET", "/api/items")).json.items.find((i) => i.code === "IS-SLOW");
+    ok("提交后 GET 可见新状态且只有 1 条领用",
+      after.status === "试磨中" && after.holder.operator === "甲" &&
+      after.events.filter((e) => e.type === "checkout").length === 1);
+    await stopServer(slowServer);
+  }
 
   await stopServer(server);
   await rm(dir, { recursive: true, force: true });

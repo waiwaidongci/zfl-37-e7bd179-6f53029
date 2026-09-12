@@ -201,7 +201,7 @@ function openModal(title, bodyHtml, submitLabel, onSubmit, opts = {}) {
   modalBox.querySelector("#modalCancel").onclick = closeModal;
   const form = modalBox.querySelector("#modalForm");
   const op = form.querySelector('[name="operator"]');
-  if (op && lastOperator) op.value = lastOperator;
+  if (op) op.value = opts.defaultOperator || lastOperator;
   form.onsubmit = async (e) => {
     e.preventDefault();
     const payload = Object.fromEntries(new FormData(form).entries());
@@ -254,12 +254,14 @@ function openReturn(item) {
       <select name="toStatus">
         <option value="已试磨">已试磨（试磨完成）</option>
         <option value="重点观察">重点观察（墨色/沉淀异常需留观）</option>
-      </select>`),
+      </select>
+      <div class="meta" style="margin-top:6px;">领用人：${esc(item.holder?.operator || "")} · 领至 ${esc(item.holder?.position || "")}（须本人归还）</div>`),
     "确认归还",
     (payload) => api(`/api/items/${encodeURIComponent(item.code)}/return`, {
       method: "POST",
       body: JSON.stringify(payload),
-    }).then(() => toast(`已归还 ${item.code}`))
+    }).then(() => toast(`已归还 ${item.code}`)),
+    { defaultOperator: item.holder?.operator || lastOperator }
   );
 }
 
@@ -279,7 +281,8 @@ function openTest(item) {
         <div><label>评分（0–100）*</label><input name="score" type="number" min="0" max="100" step="1" required></div>
       </div>
       <label>墨色层次 *</label><input name="colorLayer" required placeholder="如 焦浓重淡清分明 / 偏暖 / 发灰">
-      <label>沉淀情况 *</label><input name="sediment" required placeholder="如 无 / 少量细沙感">`),
+      <label>沉淀情况 *</label><input name="sediment" required placeholder="如 无 / 少量细沙感">
+      <div class="meta" style="margin-top:6px;">当前由 ${esc(item.holder?.operator || "")} 在 ${esc(item.holder?.position || "")} 试磨，记录须本人提交。</div>`),
     "保存试磨记录",
     async (payload) => {
       await api(`/api/items/${encodeURIComponent(item.code)}/tests`, {
@@ -287,7 +290,8 @@ function openTest(item) {
         body: JSON.stringify(payload),
       });
       toast(`试磨记录已追加（${payload.paper}，评分 ${payload.score}）`);
-    }
+    },
+    { defaultOperator: item.holder?.operator || lastOperator }
   );
 }
 

@@ -5,6 +5,7 @@ import {
   writeFile,
   rename,
   open,
+  unlink,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -122,19 +123,46 @@ const seed = {
 
 /* ---------------- 持久化 ---------------- */
 
+// 验证用故障注入：INK_FAIL_WRITES=N 表示服务开始监听后的前 N 次 persist 强制失败
+let failWritesLeft = 0;
+let writesArmed = false;
+// 验证用：INK_SLOW_WRITE_MS=N 让每次落盘先等待 N 毫秒，用于观察写入中的读一致性
+const slowWriteMs = Number(process.env.INK_SLOW_WRITE_MS || 0) || 0;
+
 async function persist(db) {
+  if (writesArmed && failWritesLeft > 0) {
+    failWritesLeft -= 1;
+    const err = new Error("模拟磁盘写入失败（INK_FAIL_WRITES 注入）");
+    err.code = "INJECTED_WRITE_FAILURE";
+    throw err;
+  }
+  if (slowWriteMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, slowWriteMs));
+  }
   await mkdir(dirname(dbPath), { recursive: true });
   const tmp = `${dbPath}.tmp-${process.pid}`;
   const payload = JSON.stringify(db, null, 2);
   const fh = await open(tmp, "w");
+  let writeError = null;
   try {
     await fh.writeFile(payload, "utf8");
     // 落盘后再改名，保证任何时刻正式文件要么是旧版要么是新版，不会只写一半
     await fh.sync();
+  } catch (err) {
+    writeError = err;
   } finally {
-    await fh.close();
+    await fh.close().catch(() => {});
   }
-  await rename(tmp, dbPath);
+  if (writeError) {
+    await unlink(tmp).catch(() => {});
+    throw writeError;
+  }
+  try {
+    await rename(tmp, dbPath);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 async function loadDb() {
@@ -335,6 +363,17 @@ function requireText(input, key, label) {
   return v;
 }
 
+/** 试磨/归还仅限当前领用人本人；否则 403 并说明当前持有人 */
+function requireHolder(item, operator) {
+  if (item.status === STATUS.IN_USE && item.holder && item.holder.operator !== operator) {
+    throw new HttpError(
+      403,
+      "holder_mismatch",
+      `墨锭 ${item.code} 正由 ${item.holder.operator} 在 ${item.holder.position} 试磨中，仅领用人本人可操作，${operator} 无权试磨或归还。`
+    );
+  }
+}
+
 function summarize(item) {
   const tests = item.events.filter((e) => e.type === "test");
   const last = item.events[item.events.length - 1] || null;
@@ -455,20 +494,44 @@ const server = http.createServer(async (req, res) => {
     const idemKey = req.headers["x-idempotency-key"]?.toString().trim();
 
     const result = await mutate(async () => {
-      // 幂等重放：同一 requestId 直接返回首次结果，不重复落库
+      // 幂等重放：同一 requestId 直接返回首次成功时的快照（深拷贝，与活动状态隔离）
       if (idemKey && db.requestIds[idemKey]) {
         const cached = db.requestIds[idemKey];
-        return { status: cached.status, body: cached.body, replayed: true };
+        return {
+          status: cached.status,
+          body: structuredClone(cached.body),
+          replayed: true,
+        };
       }
-      const out = await route(pathname, input);
-      if (idemKey) rememberIdempotency(db, idemKey, out.status, out.body);
-      await persist(db);
-      return out;
+      // 事务在草稿副本上完成全部校验与变更：活动 db 在此期间保持旧值，
+      // 并发 GET 永远读不到“未提交”状态，业务失败也无需回滚
+      const draft = structuredClone(db);
+      const out = await route(draft, pathname, input);
+      if (idemKey) {
+        rememberIdempotency(draft, idemKey, out.status, structuredClone(out.body));
+      }
+      try {
+        await persist(draft);
+      } catch (err) {
+        // 落盘失败：草稿直接丢弃，活动内存与磁盘都还是旧状态，幂等键也未被占用
+        const wrapped = new Error(
+          `数据未能写入磁盘，本次操作未生效（内存与磁盘均保持原状，未占用幂等键），请在存储恢复后重试。原因：${err.message}`
+        );
+        wrapped.code = "WRITE_FAILED";
+        throw wrapped;
+      }
+      // 提交点：落盘成功后才用草稿整体替换活动状态
+      db = draft;
+      // 返回深拷贝快照：这是“首次成功时”的完整状态，后续操作不改变旧响应
+      return { status: out.status, body: structuredClone(out.body) };
     });
 
     res.setHeader("Idempotent-Replayed", result.replayed ? "true" : "false");
     return send(res, result.status, result.body);
   } catch (error) {
+    if (error.code === "WRITE_FAILED") {
+      return send(res, 507, { error: "write_failed", message: error.message });
+    }
     if (error instanceof HttpError) {
       return send(res, error.status, { error: error.code, message: error.message });
     }
@@ -479,8 +542,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-/** POST 路由，运行在写入串行队列中，返回 {status, body} */
-function route(pathname, input) {
+/** POST 路由，运行在写入串行队列中，在草稿 db 上变更，返回 {status, body} */
+function route(draftDb, pathname, input) {
   let m;
 
   if (pathname === "/api/items") {
@@ -492,7 +555,7 @@ function route(pathname, input) {
         "墨锭编号只能包含字母、数字、中划线，长度 1–32"
       );
     }
-    if (db.items.some((i) => i.code === code)) {
+    if (draftDb.items.some((i) => i.code === code)) {
       throw new HttpError(409, "duplicate_code", `墨锭编号 ${code} 已存在，编号必须唯一`);
     }
     const item = {
@@ -514,13 +577,13 @@ function route(pathname, input) {
         },
       ],
     };
-    db.items.unshift(item);
+    draftDb.items.unshift(item);
     return { status: 201, body: summarize(item) };
   }
 
   m = pathname.match(/^\/api\/items\/([^/]+)\/checkout$/);
   if (m) {
-    const item = findItem(decodeURIComponent(m[1]));
+    const item = findItem(draftDb, decodeURIComponent(m[1]));
     const to = applyTransition(item, "checkout");
     const operator = requireText(input, "operator", "操作人");
     const position = requireText(input, "position", "领用位置");
@@ -543,10 +606,12 @@ function route(pathname, input) {
 
   m = pathname.match(/^\/api\/items\/([^/]+)\/return$/);
   if (m) {
-    const item = findItem(decodeURIComponent(m[1]));
+    const item = findItem(draftDb, decodeURIComponent(m[1]));
     const toWatch = input.toStatus === STATUS.WATCH;
     const to = applyTransition(item, toWatch ? "return_watch" : "return_done");
     const operator = requireText(input, "operator", "操作人");
+    // 谁领用谁归还：试磨中的墨锭不允许他人代为归还
+    requireHolder(item, operator);
     const position = requireText(input, "position", "归还位置");
     const holder = item.holder;
     item.holder = null;
@@ -565,7 +630,7 @@ function route(pathname, input) {
 
   m = pathname.match(/^\/api\/items\/([^/]+)\/tests$/);
   if (m) {
-    const item = findItem(decodeURIComponent(m[1]));
+    const item = findItem(draftDb, decodeURIComponent(m[1]));
     // 试磨记录只能在“试磨中”追加；归还后想补测请重新领用（已试磨/重点观察都允许再领）
     if (item.status !== STATUS.IN_USE) {
       const err = new Error(
@@ -575,6 +640,8 @@ function route(pathname, input) {
       throw err;
     }
     const operator = requireText(input, "operator", "操作人");
+    // 试磨记录只能由当前领用人本人追加，他人不能操作正在试磨的墨锭
+    requireHolder(item, operator);
     const scoreRaw = requireText(input, "score", "评分");
     const score = Number(scoreRaw);
     if (!Number.isFinite(score) || score < 0 || score > 100) {
@@ -600,7 +667,7 @@ function route(pathname, input) {
 
   m = pathname.match(/^\/api\/items\/([^/]+)\/watch$/);
   if (m) {
-    const item = findItem(decodeURIComponent(m[1]));
+    const item = findItem(draftDb, decodeURIComponent(m[1]));
     const unwatch = input.unwatch === true;
     const action = unwatch ? "unwatch" : "watch";
     const to = applyTransition(item, action);
@@ -620,8 +687,8 @@ function route(pathname, input) {
   throw new HttpError(404, "not_found", "接口不存在");
 }
 
-function findItem(code) {
-  const item = db.items.find((i) => i.code === code);
+function findItem(targetDb, code) {
+  const item = targetDb.items.find((i) => i.code === code);
   if (!item) {
     throw new HttpError(404, "item_not_found", `墨锭 ${code} 不存在`);
   }
@@ -629,6 +696,9 @@ function findItem(code) {
 }
 
 server.listen(port, () => {
+  // 此时启动阶段的迁移落盘已完成，再启用验证用的写入故障注入
+  failWritesLeft = Number(process.env.INK_FAIL_WRITES || 0) || 0;
+  writesArmed = true;
   console.log(`墨锭试磨室 listening on http://localhost:${port}`);
   console.log(`数据文件：${dbPath}`);
 });
