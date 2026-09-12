@@ -14,7 +14,39 @@
           "note": "宣纸20滴水，出墨快，评分86",
           "score": 86
         }
-      ]
+      ],
+      "events": [
+        {
+          "id": "IS-001-mig-1",
+          "at": "2026-06-11",
+          "type": "checkout",
+          "operator": "历史导入",
+          "position": "恒湿柜B",
+          "note": "旧记录补录领用"
+        },
+        {
+          "id": "IS-001-mig-2",
+          "at": "2026-06-11",
+          "type": "test",
+          "operator": "历史导入",
+          "paper": "",
+          "water": "",
+          "speed": "",
+          "colorLayer": "",
+          "sediment": "",
+          "score": 86,
+          "note": "宣纸20滴水，出墨快，评分86"
+        },
+        {
+          "id": "IS-001-mig-3",
+          "at": "2026-06-11",
+          "type": "return",
+          "operator": "历史导入",
+          "position": "恒湿柜B",
+          "note": "旧记录补录归还"
+        }
+      ],
+      "holder": null
     },
     {
       "code": "IS-002",
@@ -41,7 +73,41 @@
           "sediment": "少",
           "score": 79
         }
-      ]
+      ],
+      "events": [
+        {
+          "id": "IS-002-mig-1",
+          "at": "2026-06-21T03:50:28.907Z",
+          "type": "checkout",
+          "operator": "历史导入",
+          "position": "试样盒C",
+          "note": "旧记录补录领用"
+        },
+        {
+          "id": "IS-002-mig-2",
+          "at": "2026-06-21T03:50:28.907Z",
+          "type": "test",
+          "operator": "历史导入",
+          "paper": "棉连纸",
+          "water": "18滴",
+          "speed": "中",
+          "colorLayer": "偏暖",
+          "sediment": "少",
+          "score": 79,
+          "note": ""
+        },
+        {
+          "id": "IS-002-mig-3",
+          "at": "2026-06-21T03:50:28.907Z",
+          "type": "return",
+          "operator": "历史导入",
+          "position": "试样盒C",
+          "note": "旧记录补录归还"
+        }
+      ],
+      "holder": null
     }
-  ]
+  ],
+  "version": 2,
+  "requestIds": {}
 }
